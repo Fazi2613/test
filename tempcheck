@@ -1,0 +1,191 @@
+# ==============================
+# Remote CPU Temperature Monitor
+# CIM + DCOM
+# ==============================
+
+$pcFile = Join-Path $PSScriptRoot "pcs.txt"
+
+# Hány gépet kérdezünk egyszerre
+$MaxParallel = 30
+
+# Timeout másodpercben
+$TimeoutSeconds = 10
+
+if (-not (Test-Path $pcFile)) {
+    Write-Host "ERROR: pcs.txt not found!" -ForegroundColor Red
+    Read-Host "Press Enter to exit"
+    exit
+}
+
+# Credential bekérése egyszer
+$cred = Get-Credential -Message "Enter the remote PC administrator credentials"
+
+$PCs = Get-Content $pcFile |
+    ForEach-Object { $_.Trim() } |
+    Where-Object { $_ -and -not $_.StartsWith("#") } |
+    Select-Object -Unique
+
+Write-Host ""
+Write-Host "PCs found: $($PCs.Count)" -ForegroundColor Cyan
+Write-Host "Starting CPU temperature monitoring..." -ForegroundColor Cyan
+Write-Host ""
+
+while ($true) {
+
+    $Results = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
+
+    $jobs = foreach ($PC in $PCs) {
+
+        while (
+            @(
+                Get-Job -State Running |
+                Where-Object { $_.Name -like "CPU_TEMP_*" }
+            ).Count -ge $MaxParallel
+        ) {
+            Start-Sleep -Milliseconds 100
+        }
+
+        Start-Job -Name "CPU_TEMP_$PC" -ArgumentList $PC,$cred,$TimeoutSeconds -ScriptBlock {
+
+            param(
+                $PC,
+                $cred,
+                $TimeoutSeconds
+            )
+
+            $result = [PSCustomObject]@{
+                PC          = $PC
+                Temperature = $null
+                Status      = "ERROR"
+            }
+
+            $session = $null
+
+            try {
+
+                $option = New-CimSessionOption -Protocol Dcom
+
+                $session = New-CimSession `
+                    -ComputerName $PC `
+                    -Credential $cred `
+                    -SessionOption $option `
+                    -OperationTimeoutSec ($TimeoutSeconds * 1000)
+
+                $sensors = Get-CimInstance `
+                    -CimSession $session `
+                    -Namespace "root\wmi" `
+                    -ClassName "MSAcpi_ThermalZoneTemperature" `
+                    -OperationTimeoutSec ($TimeoutSeconds * 1000)
+
+                # Elsőként TZ02_0-t keressük,
+                # mert a tesztgépen ez a CPU.
+                $cpu = $sensors |
+                    Where-Object {
+                        $_.InstanceName -eq "ACPI\ThermalZone\TZ02_0"
+                    } |
+                    Select-Object -First 1
+
+                # Ha nincs TZ02_0, próbáljuk meg
+                # az első érvényes thermal zone-t.
+                if (-not $cpu) {
+                    $cpu = $sensors |
+                        Where-Object {
+                            $_.CurrentTemperature -gt 0
+                        } |
+                        Select-Object -First 1
+                }
+
+                if ($cpu) {
+
+                    $temperature = ($cpu.CurrentTemperature / 10) - 273.15
+
+                    $result.Temperature = [math]::Round($temperature, 2)
+                    $result.Status = "OK"
+
+                }
+                else {
+                    $result.Status = "CPU SENSOR NOT FOUND"
+                }
+
+            }
+            catch {
+                $result.Status = $_.Exception.Message
+            }
+            finally {
+
+                if ($session) {
+                    Remove-CimSession $session -ErrorAction SilentlyContinue
+                }
+
+            }
+
+            return $result
+        }
+    }
+
+    # Megvárjuk az összes jobot
+    while (
+        @(Get-Job | Where-Object {
+            $_.Name -like "CPU_TEMP_*" -and
+            $_.State -eq "Running"
+        }).Count -gt 0
+    ) {
+        Start-Sleep -Milliseconds 200
+    }
+
+    # Eredmények
+    $AllJobs = Get-Job | Where-Object {
+        $_.Name -like "CPU_TEMP_*"
+    }
+
+    foreach ($job in $AllJobs) {
+
+        $data = Receive-Job $job -ErrorAction SilentlyContinue
+
+        if ($data) {
+            $Results.Add($data)
+        }
+
+        Remove-Job $job -Force -ErrorAction SilentlyContinue
+    }
+
+    Clear-Host
+
+    Write-Host "=============================================" -ForegroundColor Cyan
+    Write-Host "       REMOTE CPU TEMPERATURE MONITOR" -ForegroundColor Cyan
+    Write-Host "=============================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "PCs: $($PCs.Count)    Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Gray
+    Write-Host ""
+
+    $Results |
+        Sort-Object PC |
+        ForEach-Object {
+
+            if ($_.Status -eq "OK") {
+
+                $temp = "{0:N2}" -f $_.Temperature
+
+                if ($_.Temperature -ge 90) {
+                    Write-Host ("{0,-18} {1,8} °C" -f $_.PC,$temp) -ForegroundColor Red
+                }
+                elseif ($_.Temperature -ge 80) {
+                    Write-Host ("{0,-18} {1,8} °C" -f $_.PC,$temp) -ForegroundColor Yellow
+                }
+                else {
+                    Write-Host ("{0,-18} {1,8} °C" -f $_.PC,$temp)
+                }
+
+            }
+            else {
+
+                Write-Host ("{0,-18} ERROR: {1}" -f $_.PC,$_.Status) -ForegroundColor DarkYellow
+
+            }
+        }
+
+    Write-Host ""
+    Write-Host "Next scan in 5 seconds..." -ForegroundColor DarkGray
+
+    Start-Sleep -Seconds 5
+}
