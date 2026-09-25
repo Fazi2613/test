@@ -1,0 +1,281 @@
+# ============================================================
+# Remote CPU Temperature Monitor
+# CIM + DCOM
+#
+# pcs.txt format:
+# PC_ID IP_ADDRESS
+#
+# Example:
+# ABC111ABC000 192.168.1.101
+# ABC111ABC001 192.168.1.102
+# ============================================================
+$pcFile = Join-Path $PSScriptRoot "pcs.txt"
+# Maximum number of PCs queried simultaneously
+$MaxParallel = 30
+# Timeout per PC
+$TimeoutSeconds = 10
+# Scan interval
+$ScanIntervalSeconds = 5
+# ============================================================
+# Check pcs.txt
+# ============================================================
+if (-not (Test-Path $pcFile)) {
+    Write-Host "ERROR: pcs.txt not found!" -ForegroundColor Red
+    Read-Host "Press Enter to exit"
+    exit
+}
+# ============================================================
+# Read PC list
+# ============================================================
+$PCs = @(
+    Get-Content $pcFile |
+    ForEach-Object {
+        $line = $_.Trim()
+        if ($line -and -not $line.StartsWith("#")) {
+            $parts = $line -split '\s+'
+            if ($parts.Count -ge 2) {
+                [PSCustomObject]@{
+                    ID = $parts[0]
+                    IP = $parts[1]
+                }
+            }
+        }
+    }
+)
+if ($PCs.Count -eq 0) {
+    Write-Host "ERROR: No PCs found in pcs.txt!" -ForegroundColor Red
+    Read-Host "Press Enter to exit"
+    exit
+}
+# ============================================================
+# Credential
+# ============================================================
+$cred = Get-Credential -Message "Enter remote PC administrator credentials"
+Write-Host ""
+Write-Host "PCs found: $($PCs.Count)" -ForegroundColor Cyan
+Write-Host "Maximum parallel connections: $MaxParallel" -ForegroundColor Cyan
+Write-Host "Scan interval: $ScanIntervalSeconds seconds" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Starting monitor..." -ForegroundColor Green
+Start-Sleep -Seconds 2
+# ============================================================
+# Continuous monitoring
+# ============================================================
+while ($true) {
+    $StartTime = Get-Date
+    $Jobs = @()
+    # ========================================================
+    # Start jobs
+    # ========================================================
+    foreach ($PC in $PCs) {
+        # Wait until there are fewer than MaxParallel jobs
+        while (
+            @(
+                Get-Job |
+                Where-Object {
+                    $_.Name -like "CPU_TEMP_*" -and
+                    $_.State -eq "Running"
+                }
+            ).Count -ge $MaxParallel
+        ) {
+            Start-Sleep -Milliseconds 100
+        }
+        $Jobs += Start-Job `
+            -Name "CPU_TEMP_$($PC.ID)" `
+            -ArgumentList $PC.ID,$PC.IP,$cred,$TimeoutSeconds `
+            -ScriptBlock {
+                param(
+                    $PCID,
+                    $IP,
+                    $Credential,
+                    $TimeoutSeconds
+                )
+                # --------------------------------------------
+                # Result object
+                # --------------------------------------------
+                $Result = [PSCustomObject]@{
+                    ID          = $PCID
+                    IP          = $IP
+                    Temperature = $null
+                    Status      = "ERROR"
+                }
+                $Session = $null
+                try {
+                    # ----------------------------------------
+                    # CIM over DCOM
+                    # ----------------------------------------
+                    $Option = New-CimSessionOption -Protocol Dcom
+                    $Session = New-CimSession `
+                        -ComputerName $IP `
+                        -Credential $Credential `
+                        -SessionOption $Option `
+                        -OperationTimeoutSec ($TimeoutSeconds * 1000)
+                    # ----------------------------------------
+                    # Read ACPI thermal zones
+                    # ----------------------------------------
+                    $Sensors = Get-CimInstance `
+                        -CimSession $Session `
+                        -Namespace "root\wmi" `
+                        -ClassName "MSAcpi_ThermalZoneTemperature" `
+                        -OperationTimeoutSec ($TimeoutSeconds * 1000)
+                    # ----------------------------------------
+                    # Find CPU sensor
+                    #
+                    # On the test PC:
+                    # ACPI\ThermalZone\TZ02_0 = CPU
+                    # ----------------------------------------
+                    $CPU = $Sensors |
+                        Where-Object {
+                            $_.InstanceName -eq "ACPI\ThermalZone\TZ02_0"
+                        } |
+                        Select-Object -First 1
+                    # ----------------------------------------
+                    # Fallback if TZ02_0 does not exist
+                    # ----------------------------------------
+                    if (-not $CPU) {
+                        $CPU = $Sensors |
+                            Where-Object {
+                                $_.CurrentTemperature -gt 0
+                            } |
+                            Select-Object -First 1
+                    }
+                    # ----------------------------------------
+                    # Temperature found
+                    # ----------------------------------------
+                    if ($CPU) {
+                        $Temperature =
+                            ($CPU.CurrentTemperature / 10) - 273.15
+                        $Result.Temperature =
+                            [math]::Round($Temperature, 2)
+                        $Result.Status = "OK"
+                    }
+                    else {
+                        $Result.Status = "CPU SENSOR NOT FOUND"
+                    }
+                }
+                catch {
+                    $Result.Status =
+                        $_.Exception.Message
+                }
+                finally {
+                    # ----------------------------------------
+                    # Close CIM connection
+                    # ----------------------------------------
+                    if ($Session) {
+                        Remove-CimSession `
+                            $Session `
+                            -ErrorAction SilentlyContinue
+                    }
+                }
+                return $Result
+            }
+    }
+    # ========================================================
+    # Wait for jobs
+    # ========================================================
+    while (
+        @(
+            Get-Job |
+            Where-Object {
+                $_.Name -like "CPU_TEMP_*" -and
+                $_.State -eq "Running"
+            }
+        ).Count -gt 0
+    ) {
+        Start-Sleep -Milliseconds 200
+    }
+    # ========================================================
+    # Collect results
+    # ========================================================
+    $Results = @()
+    foreach ($Job in $Jobs) {
+        $Data = Receive-Job `
+            $Job `
+            -ErrorAction SilentlyContinue
+        if ($Data) {
+            $Results += $Data
+        }
+        Remove-Job `
+            $Job `
+            -Force `
+            -ErrorAction SilentlyContinue
+    }
+    # ========================================================
+    # Display
+    # ========================================================
+    Clear-Host
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "              REMOTE CPU TEMPERATURE MONITOR" -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "PCs: $($PCs.Count)" -ForegroundColor Gray
+    Write-Host "Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Gray
+    $Elapsed =
+        ((Get-Date) - $StartTime).TotalSeconds
+    Write-Host "Scan time: $([math]::Round($Elapsed,2)) seconds" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host (
+        "{0,-18} {1,-17} {2,12} {3}" -f
+        "PC ID",
+        "IP ADDRESS",
+        "CPU",
+        "STATUS"
+    ) -ForegroundColor White
+    Write-Host (
+        "{0,-18} {1,-17} {2,12} {3}" -f
+        "------------------",
+        "-----------------",
+        "------------",
+        "------"
+    ) -ForegroundColor DarkGray
+    # ========================================================
+    # Display sorted by PC ID
+    # ========================================================
+    $Results |
+        Sort-Object ID |
+        ForEach-Object {
+            if ($_.Status -eq "OK") {
+                $Temp =
+                    "{0:N2} °C" -f $_.Temperature
+                if ($_.Temperature -ge 90) {
+                    Write-Host (
+                        "{0,-18} {1,-17} {2,12} {3}" -f
+                        $_.ID,
+                        $_.IP,
+                        $Temp,
+                        "OK"
+                    ) -ForegroundColor Red
+                }
+                elseif ($_.Temperature -ge 80) {
+                    Write-Host (
+                        "{0,-18} {1,-17} {2,12} {3}" -f
+                        $_.ID,
+                        $_.IP,
+                        $Temp,
+                        "WARNING"
+                    ) -ForegroundColor Yellow
+                }
+                else {
+                    Write-Host (
+                        "{0,-18} {1,-17} {2,12} {3}" -f
+                        $_.ID,
+                        $_.IP,
+                        $Temp,
+                        "OK"
+                    )
+                }
+            }
+            else {
+                Write-Host (
+                    "{0,-18} {1,-17} {2,12} {3}" -f
+                    $_.ID,
+                    $_.IP,
+                    "---",
+                    $_.Status
+                ) -ForegroundColor DarkYellow
+            }
+        }
+    Write-Host ""
+    Write-Host "Next scan in $ScanIntervalSeconds seconds..." -ForegroundColor DarkGray
+    Start-Sleep -Seconds $ScanIntervalSeconds
+}
