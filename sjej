@@ -2,3 +2,6 @@ Write-Host "=== MSAcpi_ThermalZoneTemperature ===" -ForegroundColor Cyan; Get-Ci
 
 
 while ($true) { $x=Get-CimInstance -Namespace root\wmi -ClassName MSAcpi_ThermalZoneTemperature | Where-Object InstanceName -like '*TZ02*'; "{0:HH:mm:ss.fff}  {1:N2} °C" -f (Get-Date),(($x.CurrentTemperature/10)-273.15); Start-Sleep -Milliseconds 100 }
+
+
+while ($true) { $x=Get-CimInstance -Namespace root\wmi -ClassName MSAcpi_ThermalZoneTemperature | Where-Object InstanceName -like '*TZ02*'; "{0:HH:mm:ss.fff}  {1:N2} °C" -f (Get-Date),(($x.CurrentTemperature/10)-273.15); Start-Sleep -Milliseconds 500 }
