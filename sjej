@@ -1,1 +1,4 @@
 Write-Host "=== MSAcpi_ThermalZoneTemperature ===" -ForegroundColor Cyan; Get-CimInstance -Namespace root\wmi -ClassName MSAcpi_ThermalZoneTemperature | Select-Object InstanceName,Active,@{N='TemperatureC';E={($_.CurrentTemperature / 10) - 273.15}},@{N='CriticalC';E={($_.CriticalTripPoint / 10) - 273.15}} | Format-Table -AutoSize; Write-Host "`n=== ThermalZoneInformation ===" -ForegroundColor Cyan; Get-CimInstance -ClassName Win32_PerfFormattedData_Counters_ThermalZoneInformation | Select-Object Name,@{N='TemperatureC';E={$_.Temperature - 273.15}},@{N='HighPrecisionC';E={($_.HighPrecisionTemperature / 10) - 273.15}} | Format-Table -AutoSize
+
+
+while ($true) { $x=Get-CimInstance -Namespace root\wmi -ClassName MSAcpi_ThermalZoneTemperature | Where-Object InstanceName -like '*TZ02*'; "{0:HH:mm:ss.fff}  {1:N2} °C" -f (Get-Date),(($x.CurrentTemperature/10)-273.15); Start-Sleep -Milliseconds 100 }
